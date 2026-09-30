@@ -26,7 +26,12 @@
 
 - 点击第一个选项卡后在`Request Headers`下找到`Cookie`，右键复制cookie的值即可
 
-  > 参考格式：koa:sess=eyJ1c2xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxAwMH0=; koa:sess.sig=xJkOxxxxxxxxxxxxxxxtnM;
+  > **必须复制完整的四个字段**：`gld:sess`、`gld:sess.sig`、`koa:sess`、`koa:sess.sig`。
+  >
+  > 实测服务端认证**只依赖 `gld:sess` 与 `gld:sess.sig`**，只提供 `koa:sess` 与 `koa:sess.sig`
+  > 会被判为「没有权限」而签到失败。建议直接复制整个 Cookie 值，不要裁剪。
+  >
+  > 参考格式：`gld:sess=gld_xxxxxxxxxxxx; gld:sess.sig=xxxxxxxxxxxx; koa:sess=eyJ1c2...; koa:sess.sig=xJkO...;`
 
 ![图片加载失败](imgs/3.png)
 

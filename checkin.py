@@ -118,6 +118,9 @@ class Config:
     """默认域名"""
     DOMAINS = ["glados.cloud", "railgun.info"]
 
+    """实测为认证所必需的 cookie 字段（缺任一即返回“没有权限”）"""
+    REQUIRED_COOKIE_FIELDS = ["gld:sess", "gld:sess.sig"]
+
     """兑换计划列表"""
     EXCHANGE_PLANS = {
         ExchangePlan.PLAN100.value: 100,
@@ -131,6 +134,22 @@ class Config:
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
         self._load_config()
+
+    def _warn_if_cookie_unusable(self) -> None:
+        """在发起任何请求之前，先检查 cookie 是否包含真正参与认证的字段。
+
+        实测：服务端只认 gld:sess + gld:sess.sig，仅提供 koa:sess + koa:sess.sig
+        会被判“没有权限”。缺字段时提前报错，避免跑完两个域名才看出问题。
+        """
+        for idx, cookie in enumerate(self.cookies_list, 1):
+            missing = [name for name in self.REQUIRED_COOKIE_FIELDS if f"{name}=" not in cookie]
+            if missing:
+                logger.error(
+                    f"{LogEmoji.ERROR} Cookie {idx} 缺少必需字段: {', '.join(missing)}\n"
+                    f"           服务端认证只依赖 {' + '.join(self.REQUIRED_COOKIE_FIELDS)}，\n"
+                    f"           缺少它们会得到「没有权限」。请在签到页面 F12 → Network → 刷新 →\n"
+                    f"           Request Headers → Cookie 处复制完整值（四个字段全部保留）后更新 {self.ENV_COOKIES}。"
+                )
 
     def _load_config(self) -> None:
         """加载配置"""
@@ -152,6 +171,7 @@ class Config:
             self.cookies_list = [cookie.strip() for cookie in raw_cookies_env.split("&") if cookie.strip()]
             if not self.cookies_list:
                 raise ValueError(f"环境变量 '{self.ENV_COOKIES}' 已设置，但未包含任何有效的 Cookie。")
+            self._warn_if_cookie_unusable()
 
         if not exchange_plan_env:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_EXCHANGE_PLAN}' 未设置，将使用默认设置（不自动兑换）。")
