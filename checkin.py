@@ -1,14 +1,19 @@
-import requests
-import json
+import functools
 import os
 import logging
+import sys
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
-from pypushdeer import PushDeer
+import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from logging_config import init_logger
+
+try:
+    from pypushdeer import PushDeer
+except ImportError:  # 未安装推送依赖时不应阻塞签到本身
+    PushDeer = None
 
 
 class CheckinStatus(Enum):
@@ -17,6 +22,7 @@ class CheckinStatus(Enum):
     SUCCESS = 0
     REPEAT = 1
     FAILURE = -2
+    SKIP = 2  # 该 cookie 与该域名不匹配，不计入失败
 
 
 class ExchangePlan(Enum):
@@ -54,11 +60,13 @@ class LogEmoji:
     WARNING = "⚠️ "
     ERROR = "🔴"
     INFO = "ℹ️ "
+    SKIP = "⏭️ "
 
 
 def log_method(func):
     """日志装饰器"""
 
+    @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
         method_name = func.__name__
         emoji_map = {
@@ -75,7 +83,7 @@ def log_method(func):
             logger.error(f"{LogEmoji.COOKIE}[{self.cookie_index}] {LogEmoji.DOMAIN}[{self.domain}] {LogEmoji.ERROR} {method_name} 执行失败: {e}")
 
             DEFAULT_ERRORS = {
-                "checkin": {"status": "签到失败", "points": "0", "message": ""},
+                "checkin": {"status": "签到失败", "points": "0", "message": "", "code": CheckinStatus.FAILURE},
                 "get_status": ("None 天", -2),
                 "get_points": ("None 积分", 0),
                 "exchange": "",
@@ -160,14 +168,17 @@ class Config:
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} {'已设置' if push_key_env else '未设置'}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
 
-        if verbose_env is not None:
-            verbose_env_lower = verbose_env.lower()
+        # GitHub Actions 对未设置的 secret 传空字符串而非 None，故按“空即未设置”处理
+        if verbose_env and verbose_env.strip():
+            verbose_env_lower = verbose_env.strip().lower()
             if verbose_env_lower in ["true", "1", "yes", "y"]:
                 self.verbose = True
             elif verbose_env_lower in ["false", "0", "no", "n"]:
                 self.verbose = False
             else:
                 logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_VERBOSE}' 的值 '{verbose_env}' 无效，将使用默认值 {self.DEFAULT_VERBOSE}。")
+        elif verbose_env is not None:
+            logger.info(f"{LogEmoji.INFO} 环境变量 '{self.ENV_VERBOSE}' 为空，将使用默认值 {self.DEFAULT_VERBOSE}。")
 
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_VERBOSE}: {self.verbose}。")
 
@@ -443,23 +454,40 @@ class CheckinResult:
     days: str = "None"
     points_total: str = "None"
     exchange: str = "未兑换"
-    code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, -2: 失败
+    code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, 2: 跳过, -2: 失败
+    message: str = ""  # 服务端返回的原始原因，排查问题靠它
+    auth_ok: Optional[bool] = None  # 该域名是否接受此 cookie
 
     def to_dict(self) -> Dict[str, Union[str, CheckinStatus]]:
         result_dict = asdict(self)
         return result_dict
 
+    def describe(self) -> str:
+        """人类可读的一行结果，失败时带出服务端原因"""
+        if self.code == CheckinStatus.SKIP:
+            return f"{self.domain} 跳过（cookie 不属于该域名）"
+        if self.code == CheckinStatus.SUCCESS:
+            return f"签到成功，获得 {self.points} 积分，剩余 {self.days}，总 {self.points_total}"
+        if self.code == CheckinStatus.REPEAT:
+            return f"重复签到，剩余 {self.days}，总 {self.points_total}"
+        reason = self.message or "未知原因"
+        return f"签到失败（{reason}）"
+
 
 class PushService:
     """推送服务"""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Optional[Config] = None):
         self.config = config
 
     def send(self, title: str, content: str) -> bool:
         """发送推送"""
-        if not self.config.push_key:
+        if not (self.config and self.config.push_key):
             logger.info(f"{LogEmoji.WARNING} 未设置推送密钥，跳过推送通知。")
+            return False
+
+        if PushDeer is None:
+            logger.warning(f"{LogEmoji.WARNING} 未安装 pypushdeer，跳过推送通知。")
             return False
 
         try:
@@ -497,39 +525,69 @@ class Checker:
         for cookie_idx, cookie in enumerate(self.config.cookies_list, 1):
             logger.info(f"{LogEmoji.START} ========== 开始处理 Cookie {cookie_idx} ==========")
 
+            cookie_results = []
             for domain in self.config.DOMAINS:
                 task_idx += 1
                 logger.info(f"{LogEmoji.INFO} ----- 任务 {task_idx}/{total_tasks}: {LogEmoji.COOKIE}[{cookie_idx}] on {LogEmoji.DOMAIN}[{domain}] -----")
 
                 result = self._checkin_on_domain(cookie, cookie_idx, domain)
+                cookie_results.append(result)
                 self.results.append(result)
 
-                result_message = f"结果: {result.status}"
                 if result.code == CheckinStatus.SUCCESS:
-                    if self.config.verbose:
-                        result_message = f"结果: {result.status}, 获得 {result.points} 积分, 剩余 {result.days}, 总 {result.points_total}, {result.exchange}"
-                    self._log(cookie_idx, domain, LogEmoji.SUCCESS, result_message, force=True)
+                    self._log(cookie_idx, domain, LogEmoji.SUCCESS, f"结果: {result.describe()}", force=True)
                 else:
-                    self._log(cookie_idx, domain, LogEmoji.WARNING, result_message, force=True)
+                    self._log(cookie_idx, domain, LogEmoji.WARNING, f"结果: {result.describe()}", force=True)
+
+            self._reclassify_domain_mismatch(cookie_results)
+            self._report_unusable_cookie(cookie_idx, cookie_results)
+
+    def _reclassify_domain_mismatch(self, cookie_results: List[CheckinResult]) -> None:
+        """把“认证失败”改判为“域名不匹配”，前提是同一个 cookie 在别的域名上成功过。
+
+        这样只有 glados.cloud cookie 的用户不会因为 railgun.info 报“没有权限”
+        而在总结里看到一个虚假的失败数。
+        """
+        if len(cookie_results) < 2:
+            return
+        if not any(r.auth_ok for r in cookie_results):
+            return  # 所有域名都认证失败 -> cookie 本身失效，保留为真实失败
+        for result in cookie_results:
+            if not result.auth_ok and result.code == CheckinStatus.FAILURE:
+                result.code = CheckinStatus.SKIP
+                result.status = "跳过（cookie 不属于该域名）"
+
+    def _report_unusable_cookie(self, cookie_idx: int, cookie_results: List[CheckinResult]) -> None:
+        """cookie 在所有域名上都认证失败时，把最可能的原因直接说清楚"""
+        if any(r.auth_ok for r in cookie_results):
+            return
+        reason = next((r.message for r in cookie_results if r.message), "未知原因")
+        logger.error(
+            f"{LogEmoji.ERROR} Cookie {cookie_idx} 在所有域名上均认证失败，服务端返回：{reason}\n"
+            f"           常见原因：cookie 已过期或复制不完整。请在 glados.cloud 重新登录，\n"
+            f"           F12 → Network → 刷新 → Request Headers → 复制完整的 Cookie 值（需含 koa:sess 与 koa:sess.sig）后更新 GLADOS_COOKIES。"
+        )
 
     def _checkin_on_domain(self, cookie: str, cookie_idx: int, domain: str) -> CheckinResult:
         result = CheckinResult(cookie_idx, domain)
 
         with API(domain, cookie_idx, verbose=self.config.verbose) as api:
-            # 1. 获取状态
+            # 1. 获取状态（leftDays 取不到即代表该域名不接受此 cookie）
             self._log(cookie_idx, domain, LogEmoji.STATUS, "查询剩余天数")
-            days_str, status_code = api.get_status(cookie)
+            days_str, _ = api.get_status(cookie)
             result.days = days_str
+            result.auth_ok = days_str != "None 天"
 
             # 2. 签到
             self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
+            result.message = str(checkin_result.get("message", ""))
 
             # 3. 获取积分
             self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
-            points_str, points_num = api.get_points(cookie)
+            points_str, _ = api.get_points(cookie)
             result.points_total = points_str
 
             # 4. 执行兑换（未配置有效兑换计划时跳过）
@@ -559,32 +617,58 @@ class Checker:
         success_count = sum(1 for r in results if r["code"] == CheckinStatus.SUCCESS)
         repeat_count = sum(1 for r in results if r["code"] == CheckinStatus.REPEAT)
         fail_count = sum(1 for r in results if r["code"] == CheckinStatus.FAILURE)
+        skip_count = sum(1 for r in results if r["code"] == CheckinStatus.SKIP)
 
-        title = f"GLaDOS 签到, 成功{success_count}, 失败{fail_count}, 重复{repeat_count}"
+        title = f"GLaDOS 签到, 成功{success_count}, 重复{repeat_count}, 失败{fail_count}"
+        if skip_count:
+            title += f", 跳过{skip_count}"
 
         send_content_lines = []
         log_content_lines = []
         for i, res in enumerate(results, 1):
-            line = f"#{i} P:{res['points']} 剩余:{res['days']} 总积分:{res['points_total']} | {res['status']} | {res['exchange']}"
+            # 失败项必须带上服务端原因，否则用户只能看到“签到失败”四个字
+            line = f"#{i} {self._describe_dict(res)}"
+            if res["code"] == CheckinStatus.SUCCESS and res["exchange"] != "未兑换":
+                line += f" | {res['exchange']}"
             send_content_lines.append(line)
-
-            if self.config.verbose:
-                log_line = line
-            else:
-                log_line = f"#{i} {res['status']}"
-            log_content_lines.append(log_line)
+            log_content_lines.append(line)
 
         content = "\n".join(send_content_lines)
         log_content = "\n".join(log_content_lines)
         return title, content, log_content
+
+    @staticmethod
+    def _describe_dict(res: Dict[str, Union[str, CheckinStatus]]) -> str:
+        """结果字典的可读描述（to_dict 之后 describe 已不可用）"""
+        code = res["code"]
+        if code == CheckinStatus.SKIP:
+            return f"{res['domain']} 跳过（cookie 不属于该域名）"
+        if code == CheckinStatus.SUCCESS:
+            return f"{res['domain']} 签到成功，获得 {res['points']} 积分，剩余 {res['days']}，总 {res['points_total']}"
+        if code == CheckinStatus.REPEAT:
+            return f"{res['domain']} 重复签到，剩余 {res['days']}，总 {res['points_total']}"
+        return f"{res['domain']} 签到失败（{res.get('message') or '未知原因'}）"
+
+    def has_real_failure(self) -> bool:
+        """是否存在真实失败（跳过不算），用于决定进程退出码"""
+        return any(r["code"] == CheckinStatus.FAILURE for r in self.get_results())
 
 
 # 初始化日志
 logger = init_logger()
 
 
-def main():
-    """主函数"""
+def main() -> int:
+    """主函数，返回进程退出码
+
+    退出码非 0 表示存在真实签到失败，GitHub Actions 会据此把 run 标红，
+    避免“job 绿了但其实一次都没签到”这种无声失败。
+    """
+    config: Optional[Config] = None
+    exit_code = 0
+    title = "GLaDOS 签到"
+    content = ""
+
     try:
         # 1. 加载配置
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
@@ -592,7 +676,8 @@ def main():
 
         if not config.cookies_list:
             logger.error(f"{LogEmoji.ERROR} 未找到有效的 Cookie, 退出程序。")
-            title, content = "# 未找到 cookies!", ""
+            title, content = "GLaDOS 签到 失败", "未找到有效的 GLADOS_COOKIES"
+            exit_code = 1
         else:
             # 2. 执行签到
             logger.info(f"{LogEmoji.START} 步骤 2: 执行签到")
@@ -604,16 +689,24 @@ def main():
             title, content, log_content = checker.format_results()
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
 
+            if checker.has_real_failure():
+                exit_code = 1
+
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
-        title, content, log_content = "# 脚本执行出错", str(e), str(e)
+        title, content = "GLaDOS 签到 出错", str(e)
+        exit_code = 1
 
-    # 4. 发送推送
+    # 4. 发送推送（config 可能为 None，PushService 已做兼容）
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
-    push_service = PushService(config if "config" in locals() else "")
+    push_service = PushService(config)
     push_service.send(title, content)
     logger.info(f"{LogEmoji.END} 签到完成")
 
+    if exit_code:
+        logger.error(f"{LogEmoji.ERROR} 本次运行存在失败项，退出码 {exit_code}")
+    return exit_code
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
