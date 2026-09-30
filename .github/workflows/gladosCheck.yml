@@ -53,10 +53,14 @@ jobs:
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
 
+    # 以下两步必须在签到失败时也执行：keepalive 负责重置 GitHub 的 60 天停用计时器，
+    # 若因签到退出码非 0 被跳过，定时任务反而会在仓库不活跃后被自动停用。
     - name: Keep alive
-      uses: liskin/gh-workflow-keepalive@v1 
-        
+      if: always()
+      uses: liskin/gh-workflow-keepalive@v1
+
     - name: Delete workflow runs
+      if: always()
       uses: Mattraks/delete-workflow-runs@v2
       with:
         token: ${{ github.token }}
