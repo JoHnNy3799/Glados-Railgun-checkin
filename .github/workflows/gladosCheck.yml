@@ -7,9 +7,19 @@ on:
     paths-ignore:
       - 'README.md'
       - 'imgs/**'
+  # 2026-10 观测：schedule 的 timezone 键不可靠，且 GitHub 高负载时会直接丢弃
+  # 某个触发点——原来的双时段配置每天实际只跑一次。因此改为直接写 UTC 时间、
+  # 拉开三个时段互为备份（对应北京时间 09:18 / 12:18 / 20:48）。
+  # 签到一天只生效一次，重复触发只会得到“重复签到”，多跑没有副作用。
   schedule:
-    - cron: '18 9,12 * * *'
-      timezone: 'Asia/Shanghai'
+    - cron: '18 1 * * *'
+    - cron: '18 4 * * *'
+    - cron: '48 12 * * *'
+
+# 前一时段被延迟、与后一时段撞车时排队而非并发，避免同时签到
+concurrency:
+  group: checkin
+  cancel-in-progress: false
 
 jobs:
   build:

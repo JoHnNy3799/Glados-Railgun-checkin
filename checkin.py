@@ -2,6 +2,7 @@ import functools
 import os
 import logging
 import sys
+import time
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
@@ -121,6 +122,13 @@ class Config:
     """实测为认证所必需的 cookie 字段（缺任一即返回“没有权限”）"""
     REQUIRED_COOKIE_FIELDS = ["gld:sess", "gld:sess.sig"]
 
+    """认证被拒的判定特征（消息包含即视为“疑似风控误伤”而非业务失败）"""
+    AUTH_REJECT_SIGNATURES = ("没有权限", "no permission")
+
+    """疑似风控误伤时整个域名流程的自动重试次数与间隔"""
+    AUTH_RETRY_ATTEMPTS = 3
+    AUTH_RETRY_WAIT_SECONDS = 45
+
     """兑换计划列表"""
     EXCHANGE_PLANS = {
         ExchangePlan.PLAN100.value: 100,
@@ -212,6 +220,16 @@ PLATFORM_UA = {
     "Android": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
 }
 
+# 与各平台 UA 配套的 Client Hints 头：(sec-ch-ua, sec-ch-ua-platform, sec-ch-ua-mobile)
+# UA 与 Client Hints 混搭（如 iPhone UA 配 Windows 平台声明）会暴露脚本特征
+PLATFORM_SEC_CH = {
+    "Windows": ('"Chromium";v="120", "Google Chrome";v="120", "Not?Brand";v="99"', '"Windows"', "?0"),
+    "macOS": ('"Chromium";v="120", "Google Chrome";v="120", "Not?Brand";v="99"', '"macOS"', "?0"),
+    "Linux": ('"Chromium";v="120", "Google Chrome";v="120", "Not?Brand";v="99"', '"Linux"', "?0"),
+    "iPhone": ('"Chromium";v="120", "Mobile Chrome";v="120", "Not?Brand";v="99"', '"iOS"', "?1"),
+    "Android": ('"Chromium";v="120", "Mobile Chrome";v="120", "Not?Brand";v="99"', '"Android"', "?1"),
+}
+
 
 class API:
     """API 调用"""
@@ -263,11 +281,35 @@ class API:
         return False
 
     def _get_headers(self) -> Dict[str, str]:
-        """获取请求头"""
+        """获取请求头。
+
+        2026-10 观测：仅带 origin + UA 的裸请求，签到/状态接口会被服务端风控
+        随机判「没有权限」（Cookie 本身有效，积分/兑换接口同秒可通过认证）。
+        补齐真实浏览器都会发送的常规 header，降低被误伤概率。
+        """
         return {
+            "accept": "application/json, text/plain, */*",
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
             "origin": f"https://{self.domain}",
+            "referer": f"https://{self.domain}/console/checkin",
             "user-agent": PLATFORM_UA["Windows"],
+            "sec-ch-ua": PLATFORM_SEC_CH["Windows"][0],
+            "sec-ch-ua-mobile": PLATFORM_SEC_CH["Windows"][2],
+            "sec-ch-ua-platform": PLATFORM_SEC_CH["Windows"][1],
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
         }
+
+    def _headers_for(self, platform: str) -> Dict[str, str]:
+        """整套请求头按平台适配（UA 与 Client Hints 必须自洽）"""
+        headers = self.headers.copy()
+        sec_ua, sec_platform, sec_mobile = PLATFORM_SEC_CH.get(platform, PLATFORM_SEC_CH["Windows"])
+        headers["user-agent"] = PLATFORM_UA.get(platform, headers["user-agent"])
+        headers["sec-ch-ua"] = sec_ua
+        headers["sec-ch-ua-mobile"] = sec_mobile
+        headers["sec-ch-ua-platform"] = sec_platform
+        return headers
 
     def _log(self, level: str, emoji: str, message: str, force: bool = False) -> None:
         """统一日志输出方法"""
@@ -286,11 +328,11 @@ class API:
         """获取完整 URL"""
         return f"https://{self.domain}{path}"
 
-    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", user_agent: Optional[str] = None) -> Optional[requests.Response]:
+    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", headers_override: Optional[Dict[str, str]] = None) -> Optional[requests.Response]:
         """发送 HTTP 请求"""
         session_headers = self.headers.copy()
-        if user_agent:
-            session_headers["user-agent"] = user_agent
+        if headers_override:
+            session_headers.update(headers_override)
         session_headers["cookie"] = cookies
 
         try:
@@ -320,24 +362,24 @@ class API:
         url = self._get_full_url(self.CHECKIN_URL)
         checkin_data = self._get_checkin_data()
 
-        # 起始 UA 优先复用已学得的设备 UA，否则用会话默认 UA
-        start_ua = self._device_ua_cache.get("_last") or self.headers.get("user-agent")
+        # 起始平台优先复用已学得的设备平台，否则用 Windows
+        start_platform = self._device_ua_cache.get("_last") or "Windows"
 
-        raw = self._checkin_attempt(url, checkin_data, cookies, start_ua)
+        raw = self._checkin_attempt(url, checkin_data, cookies, start_platform)
 
-        # 设备不匹配(code 4)时按服务端 loginDevice 切换 UA 重试一次
+        # 设备不匹配(code 4)时按服务端 loginDevice 切换平台重试一次
         if raw is not None and raw.get("code") == 4 and raw.get("reason") == "device-mismatch":
             login_device = raw.get("loginDevice")
-            recover_ua = self._device_ua_cache.get(login_device) or PLATFORM_UA.get(login_device)
-            if recover_ua and recover_ua != start_ua:
+            recover_platform = self._device_ua_cache.get(login_device) or login_device
+            if recover_platform in PLATFORM_UA and recover_platform != start_platform:
                 self._log("warning", LogEmoji.WARNING, f"设备平台不匹配 (loginDevice={login_device})，切换 UA 重试", force=True)
-                raw = self._checkin_attempt(url, checkin_data, cookies, recover_ua)
+                raw = self._checkin_attempt(url, checkin_data, cookies, recover_platform)
 
         return self._parse_checkin(raw)
 
-    def _checkin_attempt(self, url: str, data: Dict, cookies: str, user_agent: str) -> Optional[Dict]:
+    def _checkin_attempt(self, url: str, data: Dict, cookies: str, platform: str) -> Optional[Dict]:
         """发起一次签到请求并返回解析后的响应体（失败返回 None）"""
-        response = self._make_request(url, "POST", data, cookies, user_agent=user_agent)
+        response = self._make_request(url, "POST", data, cookies, headers_override=self._headers_for(platform))
         if not response:
             return None
         try:
@@ -346,13 +388,13 @@ class API:
             self._log("error", LogEmoji.ERROR, "签到响应解析失败", force=True)
             return None
 
-        # 缓存学得的设备 UA，供本次运行后续请求复用
+        # 缓存学得的设备平台，供本次运行后续请求复用
         if raw.get("code") == 4 and raw.get("reason") == "device-mismatch":
             login_device = raw.get("loginDevice")
             if login_device in PLATFORM_UA:
-                self._device_ua_cache[login_device] = PLATFORM_UA[login_device]
+                self._device_ua_cache[login_device] = login_device
         elif raw.get("code") in (CheckinStatus.SUCCESS.value, CheckinStatus.REPEAT.value):
-            self._device_ua_cache["_last"] = user_agent
+            self._device_ua_cache["_last"] = platform
 
         return raw
 
@@ -582,47 +624,77 @@ class Checker:
         if any(r.auth_ok for r in cookie_results):
             return
         reason = next((r.message for r in cookie_results if r.message), "未知原因")
+        sess_fields = " 与 ".join(self.config.REQUIRED_COOKIE_FIELDS)
         logger.error(
-            f"{LogEmoji.ERROR} Cookie {cookie_idx} 在所有域名上均认证失败，服务端返回：{reason}\n"
-            f"           常见原因：cookie 已过期或复制不完整。请在 glados.cloud 重新登录，\n"
-            f"           F12 → Network → 刷新 → Request Headers → 复制完整的 Cookie 值（需含 koa:sess 与 koa:sess.sig）后更新 GLADOS_COOKIES。"
+            f"{LogEmoji.ERROR} Cookie {cookie_idx} 在所有域名上均认证失败（已自动重试 {self.config.AUTH_RETRY_ATTEMPTS} 次），服务端返回：{reason}\n"
+            f"           两种可能：\n"
+            f"           ① Cookie 过期或不完整——请在 glados.cloud 重新登录，F12 → Network → 刷新 →\n"
+            f"              Request Headers → 复制完整的 Cookie 值（需含 {sess_fields}）后更新 {self.config.ENV_COOKIES}；\n"
+            f"           ② 服务端风控持续拦截数据中心 IP（Cookie 仍有效）——等下个定时时段自动再试即可。"
         )
 
     def _checkin_on_domain(self, cookie: str, cookie_idx: int, domain: str) -> CheckinResult:
+        with API(domain, cookie_idx, verbose=self.config.verbose) as api:
+            result = self._attempt_domain_flow(api, cookie, cookie_idx, domain)
+
+            # 2026-10 观测：合法 Cookie 也会被服务端风控连同数据中心 IP 一起拒绝
+            # （返回“没有权限”，但同秒积分/兑换接口可通过认证），是否触发与出口 IP
+            # 相关、逐日随机。等待后重试通常能过；Cookie 真失效时重试结果不变，仍按失败上报。
+            attempt = 2
+            while self._is_auth_rejected(result) and attempt <= self.config.AUTH_RETRY_ATTEMPTS:
+                logger.warning(
+                    f"{LogEmoji.WARNING} Cookie {cookie_idx} 在 {domain} 被拒（{result.message}），"
+                    f"疑似风控误伤，{self.config.AUTH_RETRY_WAIT_SECONDS} 秒后重试"
+                    f"（第 {attempt}/{self.config.AUTH_RETRY_ATTEMPTS} 次尝试）"
+                )
+                time.sleep(self.config.AUTH_RETRY_WAIT_SECONDS)
+                result = self._attempt_domain_flow(api, cookie, cookie_idx, domain)
+                attempt += 1
+
+        return result
+
+    @staticmethod
+    def _is_auth_rejected(result: CheckinResult) -> bool:
+        """是否为“认证被拒”形态：认证失败 + 服务端返回没有权限类消息（区别于业务失败）"""
+        if result.auth_ok or result.code != CheckinStatus.FAILURE:
+            return False
+        message = (result.message or "").lower()
+        return any(sig.lower() in message for sig in Config.AUTH_REJECT_SIGNATURES)
+
+    def _attempt_domain_flow(self, api: API, cookie: str, cookie_idx: int, domain: str) -> CheckinResult:
         result = CheckinResult(cookie_idx, domain)
 
-        with API(domain, cookie_idx, verbose=self.config.verbose) as api:
-            # 1. 获取状态（leftDays 取不到即代表该域名不接受此 cookie）
-            self._log(cookie_idx, domain, LogEmoji.STATUS, "查询剩余天数")
-            days_str, _ = api.get_status(cookie)
-            result.days = days_str
-            result.auth_ok = days_str != "None 天"
+        # 1. 获取状态（leftDays 取不到即代表该域名不接受此 cookie）
+        self._log(cookie_idx, domain, LogEmoji.STATUS, "查询剩余天数")
+        days_str, _ = api.get_status(cookie)
+        result.days = days_str
+        result.auth_ok = days_str != "None 天"
 
-            # 2. 签到
-            self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
-            checkin_result = api.checkin(cookie)
-            result.status = checkin_result["status"]
-            result.code = checkin_result.get("code", CheckinStatus.FAILURE)
-            result.message = str(checkin_result.get("message", ""))
+        # 2. 签到
+        self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
+        checkin_result = api.checkin(cookie)
+        result.status = checkin_result["status"]
+        result.code = checkin_result.get("code", CheckinStatus.FAILURE)
+        result.message = str(checkin_result.get("message", ""))
 
-            # 3. 获取积分
-            self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
-            points_str, _ = api.get_points(cookie)
-            result.points_total = points_str
+        # 3. 获取积分
+        self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
+        points_str, _ = api.get_points(cookie)
+        result.points_total = points_str
 
-            # 4. 执行兑换（未配置有效兑换计划时跳过）
-            if self.config.exchange_plan in self.config.EXCHANGE_PLANS:
-                required_points = self.config.EXCHANGE_PLANS[self.config.exchange_plan]
-                self._log(
-                    cookie_idx,
-                    domain,
-                    LogEmoji.EXCHANGE,
-                    f"开始兑换 {self.config.exchange_plan} (需要 {required_points} 积分)",
-                )
-                result.exchange = api.exchange(cookie, self.config.exchange_plan, required_points)
-            else:
-                result.exchange = "未配置兑换计划，跳过自动兑换"
-                self._log(cookie_idx, domain, LogEmoji.INFO, "未配置兑换计划，跳过自动兑换", force=True)
+        # 4. 执行兑换（未配置有效兑换计划时跳过）
+        if self.config.exchange_plan in self.config.EXCHANGE_PLANS:
+            required_points = self.config.EXCHANGE_PLANS[self.config.exchange_plan]
+            self._log(
+                cookie_idx,
+                domain,
+                LogEmoji.EXCHANGE,
+                f"开始兑换 {self.config.exchange_plan} (需要 {required_points} 积分)",
+            )
+            result.exchange = api.exchange(cookie, self.config.exchange_plan, required_points)
+        else:
+            result.exchange = "未配置兑换计划，跳过自动兑换"
+            self._log(cookie_idx, domain, LogEmoji.INFO, "未配置兑换计划，跳过自动兑换", force=True)
 
         return result
 
