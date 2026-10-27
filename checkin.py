@@ -592,7 +592,10 @@ class Checker:
                 task_idx += 1
                 logger.info(f"{LogEmoji.INFO} ----- 任务 {task_idx}/{total_tasks}: {LogEmoji.COOKIE}[{cookie_idx}] on {LogEmoji.DOMAIN}[{domain}] -----")
 
-                result = self._checkin_on_domain(cookie, cookie_idx, domain)
+                # 会话按域名隔离：同一份 Cookie 只对注册时绑定的域名有效，其余域名
+                # 永远拒绝。已有域名认证成功时，被拒的域名直接判“不匹配”，不再空等重试。
+                matched_elsewhere = any(r.auth_ok for r in cookie_results)
+                result = self._checkin_on_domain(cookie, cookie_idx, domain, skip_retry_if_matched=matched_elsewhere)
                 cookie_results.append(result)
                 self.results.append(result)
 
@@ -633,15 +636,26 @@ class Checker:
             f"           ② 服务端风控持续拦截数据中心 IP（Cookie 仍有效）——等下个定时时段自动再试即可。"
         )
 
-    def _checkin_on_domain(self, cookie: str, cookie_idx: int, domain: str) -> CheckinResult:
+    def _checkin_on_domain(self, cookie: str, cookie_idx: int, domain: str, skip_retry_if_matched: bool = False) -> CheckinResult:
         with API(domain, cookie_idx, verbose=self.config.verbose) as api:
             result = self._attempt_domain_flow(api, cookie, cookie_idx, domain)
 
             # 2026-10 观测：合法 Cookie 也会被服务端风控连同数据中心 IP 一起拒绝
             # （返回“没有权限”，但同秒积分/兑换接口可通过认证），是否触发与出口 IP
             # 相关、逐日随机。等待后重试通常能过；Cookie 真失效时重试结果不变，仍按失败上报。
+            # 若同一 Cookie 已在别的域名认证成功，则本域名的拒绝是域名隔离所致，
+            # 重试不可能改变结果，直接跳过。
             attempt = 2
             while self._is_auth_rejected(result) and attempt <= self.config.AUTH_RETRY_ATTEMPTS:
+                if skip_retry_if_matched:
+                    self._log(
+                        cookie_idx,
+                        domain,
+                        LogEmoji.INFO,
+                        f"该 Cookie 属于其他域名（{result.message}），不做重试",
+                        force=True,
+                    )
+                    break
                 logger.warning(
                     f"{LogEmoji.WARNING} Cookie {cookie_idx} 在 {domain} 被拒（{result.message}），"
                     f"疑似风控误伤，{self.config.AUTH_RETRY_WAIT_SECONDS} 秒后重试"
