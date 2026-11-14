@@ -1307,6 +1307,11 @@ def main() -> None:
             logger.info(f"{LogEmoji.START} 步骤 3: 生成报告")
             logger.info(f"\n{LogEmoji.END} ========== 签到总结 ==========\n{report.title}\n{report.render()}")
 
+            # 存在真实签到失败（含认证被拒）时以非零退出码结束，让 Actions 显红，
+            # 否则一次都没签到成功也会显示绿色对勾（静默失败）
+            if any(entry.result.code is CheckinStatus.FAILURE for entry in report.entries):
+                exit_code = 1
+
     except Exception as e:  # noqa: BLE001 - 顶层兜底，保证仍能推送错误摘要
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
         # 保留已完成账号的结果，避免一个异常吞掉全部进度
