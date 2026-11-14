@@ -1,4 +1,4 @@
-name: auto check
+name: GLaDOS Check-in
 
 on:
   workflow_dispatch:
@@ -7,25 +7,23 @@ on:
     paths-ignore:
       - 'README.md'
       - 'imgs/**'
-  # 2026-10 观测：schedule 的 timezone 键不可靠，且 GitHub 高负载时会直接丢弃
-  # 某个触发点——原来的双时段配置每天实际只跑一次。因此改为直接写 UTC 时间、
-  # 拉开三个时段互为备份（对应北京时间 09:18 / 12:18 / 20:48）。
-  # 签到一天只生效一次，重复触发只会得到“重复签到”，多跑没有副作用。
   schedule:
-    - cron: '18 1 * * *'
-    - cron: '18 4 * * *'
-    - cron: '48 12 * * *'
+    - cron: '18 9,12 * * *'
+      timezone: 'Asia/Shanghai'
 
-# 前一时段被延迟、与后一时段撞车时排队而非并发，避免同时签到
+# 定时与手动触发可能重叠：同一时间只保留一个运行，避免重复签到与重复推送
 concurrency:
-  group: checkin
+  group: glados-checkin
   cancel-in-progress: false
 
 jobs:
   build:
     name: glados/railgun checkin
     runs-on: ubuntu-latest
-      
+
+    # 脚本自带 5 分钟运行预算；这里再兜底，避免异常情况卡住
+    timeout-minutes: 15
+
     permissions:
       contents: read
       actions: write
@@ -59,18 +57,18 @@ jobs:
         python checkin.py
       env:
         PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
+        SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
 
-    # 以下两步必须在签到失败时也执行：keepalive 负责重置 GitHub 的 60 天停用计时器，
-    # 若因签到退出码非 0 被跳过，定时任务反而会在仓库不活跃后被自动停用。
+    # 签到失败（配置错误会 exit 1）时也要保活，否则恰好错过最需要提醒的那次
     - name: Keep alive
-      if: always()
-      uses: liskin/gh-workflow-keepalive@v1
-
+      if: ${{ !cancelled() }}
+      uses: liskin/gh-workflow-keepalive@v1 
+        
     - name: Delete workflow runs
-      if: always()
+      if: ${{ !cancelled() }}
       uses: Mattraks/delete-workflow-runs@v2
       with:
         token: ${{ github.token }}
