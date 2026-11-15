@@ -8,13 +8,10 @@ on:
       - 'README.md'
       - 'imgs/**'
   # 2026-10 实测：schedule 的 timezone 键不可靠且高负载时 GitHub 会直接丢弃
-  # 某个触发点，双时段配置实际每天只跑一次。改为直接写 UTC 时间、三个时段互为
-  # 备份（对应北京时间 09:18 / 12:18 / 20:48）。签到一天只生效一次，重复触发
-  # 只会得到「重复签到」，多跑没有副作用。
+  # 某个触发点。直接写 UTC 时间，对应北京时间 21:00——本机浏览器计划任务
+  # （09:30 / 14:00 两次签到机会）都跑完之后的收尾看护时点。
   schedule:
-    - cron: '18 1 * * *'
-    - cron: '18 4 * * *'
-    - cron: '48 12 * * *'
+    - cron: '0 13 * * *'
 
 # 定时与手动触发可能重叠：同一时间只保留一个运行，避免重复签到与重复推送
 concurrency:
@@ -56,16 +53,13 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    # 执行 签到脚本
-    - name: Running checkin
+    # 只读看护：检查 Cookie 认证状态（真实签到由本机浏览器计划任务完成，
+    # 云端纯 HTTP 无法通过 Cloudflare Turnstile，详见 README 与 watch.py）
+    - name: Running watch
       run: |
-        python checkin.py
+        python watch.py
       env:
-        PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
-        SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
-        GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
-        GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
 
     # 签到失败（配置错误会 exit 1）时也要保活，否则恰好错过最需要提醒的那次
     - name: Keep alive
