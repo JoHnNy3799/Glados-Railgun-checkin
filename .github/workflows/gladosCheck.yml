@@ -60,6 +60,7 @@ jobs:
         python watch.py
       env:
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
+        SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
 
     # 签到失败（配置错误会 exit 1）时也要保活，否则恰好错过最需要提醒的那次
     - name: Keep alive

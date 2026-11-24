@@ -59,7 +59,27 @@ def main():
     print("ERROR Cookie 认证失效或接口异常。处理指引：")
     print("  - 若本机浏览器签到仍正常，只需把最新 Cookie 同步到 GLADOS_COOKIES secret")
     print("  - 若本机也失败，请重新登录 glados.cloud 更新 cookie.txt 与 secret")
+    _push("GLaDOS Cookie 失效", "云端看护检测到 GLADOS_COOKIES 认证失效，"
+          "需要把最新 Cookie 同步到 secret（若本机签到正常，从 cookie.txt 复制即可）。")
     return 1
+
+
+def _push(title, body):
+    """Server酱 微信推送（配置 SERVERCHAN_SENDKEY secret 后生效）。"""
+    key = os.environ.get("SERVERCHAN_SENDKEY", "").strip()
+    if not key:
+        print("（未配置 SERVERCHAN_SENDKEY，跳过微信推送）")
+        return
+    if key.upper().startswith("SCTP"):
+        uid = key[4:].split("t")[0]
+        url = f"https://{uid}.push.ft07.com/send/{key}.send"
+    else:
+        url = f"https://sctapi.ftqq.com/{key}.send"
+    try:
+        resp = requests.post(url, data={"title": title, "desp": body}, timeout=(10, 30))
+        print(f"方糖推送 -> {resp.status_code} {resp.text[:100]}")
+    except requests.RequestException as e:
+        print(f"WARN 方糖推送失败：{type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":
