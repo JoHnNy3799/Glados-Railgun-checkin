@@ -18,6 +18,13 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 
 def main():
+    # 测试开关：workflow_dispatch 传 test_push=true 时只发一条推送，验证通道
+    if os.environ.get("TEST_PUSH", "").strip().lower() in ("1", "true", "yes"):
+        _push("GLaDOS 云端推送测试", "这条消息来自 GitHub Actions 看护任务，"
+              "说明云端检测到 Cookie 失效时会用同一个通道提醒你。")
+        print("OK 测试推送已发送")
+        return 0
+
     raw = os.environ.get("GLADOS_COOKIES", "").strip()
     if not raw:
         print("ERROR 未配置 GLADOS_COOKIES secret")

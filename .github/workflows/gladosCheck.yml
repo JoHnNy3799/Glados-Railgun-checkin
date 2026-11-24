@@ -2,6 +2,11 @@ name: GLaDOS Check-in
 
 on:
   workflow_dispatch:
+    inputs:
+      test_push:
+        description: '只发送一条方糖测试推送（验证提醒通道）'
+        type: boolean
+        default: false
   push:
     branches: [ master ]
     paths-ignore:
@@ -61,6 +66,7 @@ jobs:
       env:
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
         SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+        TEST_PUSH: ${{ inputs.test_push }}
 
     # 签到失败（配置错误会 exit 1）时也要保活，否则恰好错过最需要提醒的那次
     - name: Keep alive
