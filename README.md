@@ -302,7 +302,9 @@ Windows PowerShell 用 `$env:GLADOS_COOKIES='[...]'`。
 
 GLaDOS 自 2026-11 起在签到接口上启用了 **Cloudflare Turnstile 人机验证**（`/api/user/checkin/challenge` 返回 sitekey，签到请求必须附带浏览器产生的一次性令牌），纯 HTTP 脚本签到已被服务端拒绝（`code 5`），GitHub Actions 云端环境无法通过该验证。因此：
 
-- **真实签到由本机 Windows 计划任务 + 真实 Chrome 完成**（`D:/agent/bin/glados_browser_checkin.py`，每天 09:30 / 14:00 各一次，服务端轮换会话时页面自动续期并回写 cookie）。
+- **真实签到由本机 Windows 计划任务 + 真实 Chrome 完成**（`D:/agent/bin/glados_browser_checkin.py`，每天 7 个时段 09:30/11:30/13:30/15:30/17:30/19:30/21:30，已签到时段走 API 预检 2 秒内退出；服务端轮换会话时页面自动续期并回写 cookie）。
+  - 浏览器固定 `--no-proxy-server` 直连：系统代理指向 Clash 时 Chrome 到 glados.cloud 会超时（实测 `ERR_TIMED_OUT`），直连正常；直连失败时自动改用系统代理重试一次。
+  - 打开页面失败会重试 3 次；漏签、Cookie 失效、签到失败都会弹 Windows 系统通知提醒（同类每天最多一次）。
 - **云端 Actions 只做只读看护**（`watch.py`，每天北京时间 21:00）：检查 `GLADOS_COOKIES` 认证是否仍有效，失效时显红提醒把最新 Cookie 同步到 secret。
 - `checkin.py`（上游 challenge/proof 协议实现）保留在仓库中备查，不再被 workflow 调用。
 - `GLADOS_COOKIES` secret 需与本机 `cookie.txt` 保持同步（会话被服务端轮换后，secret 里的旧值会失效并触发看护显红）。
